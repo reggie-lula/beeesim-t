@@ -1,0 +1,253 @@
+import asyncio
+from collections import deque
+from types import SimpleNamespace
+import unittest
+from unittest.mock import AsyncMock, patch
+
+import beesim as b
+
+
+class ScriptedTransport:
+    def __init__(self, responses):
+        self.responses = deque(bytes.fromhex(x) if isinstance(x, str) else x for x in responses)
+        self.commands = []
+
+    async def send(self, command):
+        self.commands.append(command)
+        await asyncio.sleep(0)
+        if not self.responses:
+            raise AssertionError("Unexpected APDU: " + command.hex())
+        return self.responses.popleft()
+
+
+def euicc(responses):
+    return b.Euicc(ScriptedTransport(responses), delay_over_counter=0)
+
+
+def response_sequence(raw):
+    return ["9000"] * 4 + [bytes([0x61, len(raw)]), raw + bytes.fromhex("9000")]
+
+
+class CodecTests(unittest.TestCase):
+    def test_ber_length_boundaries(self):
+        for length, prefix in ((127, "907F"), (128, "908180"), (255, "9081FF"), (256, "90820100")):
+            with self.subTest(length=length):
+                encoded = b.tlv(0x90, b"a" * length)
+                self.assertTrue(encoded.hex().upper().startswith(prefix))
+                self.assertEqual(b.parse_tlv(encoded)[0]["value"], b"a" * length)
+
+    def test_malformed_tlv_rejected(self):
+        for raw in ("BF", "BF3E", "9080", "908201", "900301", "A0029001"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                b.parse_tlv(bytes.fromhex(raw))
+
+    def test_activation_codes(self):
+        self.assertEqual(b.parse_activation_code("LPA:1$rsp.example.com$abc$$1"), ("rsp.example.com", "abc", True))
+        self.assertEqual(b.parse_activation_code("1$rsp.example.com"), ("rsp.example.com", "", False))
+        with self.assertRaises(ValueError):
+            b.parse_activation_code("1$https://bad/path$abc")
+
+    def test_firmware_parser(self):
+        data = b.parse_firmware_text("F000FEF00001020304ABCD\nF200\n")
+        self.assertEqual(data["crc"], "ABCD")
+        self.assertEqual(len(data["rows"]), 2)
+        for invalid in ("F001\nF200", "F000FEF00001020304ABCD\nF200\nF001", "XYZ"):
+            with self.assertRaises(ValueError):
+                b.parse_firmware_text(invalid)
+
+
+class InitializationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_open_6a86_proceeds_to_select(self):
+        e = euicc(["6200", "9000", "6A86", "9000"])
+        await e.init()
+        self.assertTrue(e.inited)
+        self.assertEqual([x.hex().upper() for x in e.t.commands], [
+            "0070800100", "80AA00000AA9088100820101830107", "0070000100",
+            "01A4040010A0000005591010FFFFFFFF8900000100"])
+
+    async def test_select_failure_is_not_success_and_can_retry(self):
+        e = euicc(["6200", "9000", "6A86", "6A82"] + ["9000"] * 4)
+        with self.assertRaisesRegex(RuntimeError, "SELECT.*6A82.*6A86"):
+            await e.init()
+        self.assertFalse(e.inited)
+        await e.init()
+        self.assertTrue(e.inited)
+        self.assertEqual(len(e.t.commands), 8)
+
+    async def test_select_get_response(self):
+        e = euicc(["9000", "9000", "9000", "6102", "01029000"])
+        await e.init()
+        self.assertTrue(e.inited)
+        self.assertEqual(e.t.commands[-1], bytes.fromhex("81C0000002"))
+
+    async def test_6881_recovers_once(self):
+        e = euicc(["6881"] + ["9000"] * 4 + ["9000"])
+        e.inited = True
+        await e.send_command(bytes.fromhex("81E2910000"))
+        self.assertEqual(e.t.commands[0], e.t.commands[-1])
+        self.assertEqual(len(e.t.commands), 6)
+
+    async def test_store_fe_and_read_fe(self):
+        e = euicc(["00FE", "05FE", "00FE", "01026103", "0304059000"])
+        response = await e.store_bytes(b"a" * 121)
+        self.assertEqual(response, bytes.fromhex("6105"))
+        self.assertEqual(e.t.commands[0][:5], bytes.fromhex("81E2110078"))
+        self.assertEqual(e.t.commands[1][:5], bytes.fromhex("81E2910101"))
+        self.assertEqual(await e.get_response(5), bytes.fromhex("0102030405"))
+        self.assertEqual([x[1] for x in e.t.commands[2:]], [0xC0, 0xFE, 0xC0])
+
+    async def test_6c_uses_requested_length(self):
+        e = euicc(["6C02", "AABB9000"])
+        self.assertEqual(await e.get_response(4), bytes.fromhex("AABB"))
+        self.assertEqual(e.t.commands[-1][-1], 2)
+
+    async def test_transactions_do_not_interleave_store_and_read(self):
+        e = euicc(["9000"] * 4 + ["6101", "AA9000", "6101", "BB9000"])
+        first, second = await asyncio.gather(e.store_and_read(b"a"), e.store_and_read(b"b"))
+        self.assertEqual((first, second), (b"\xaa", b"\xbb"))
+        self.assertEqual([x[1] for x in e.t.commands[4:]], [0xE2, 0xC0, 0xE2, 0xC0])
+
+    async def test_low_level_chained_writes_are_atomic(self):
+        e = euicc(["9000"] * 4)
+        await asyncio.gather(e.store_bytes(b"a" * 121), e.store_bytes(b"b" * 121))
+        self.assertEqual([(x[3], chr(x[5])) for x in e.t.commands], [(0, "a"), (1, "a"), (0, "b"), (1, "b")])
+
+    async def test_short_apdu_rejected_before_transport(self):
+        e = euicc([])
+        with self.assertRaisesRegex(ValueError, "header"):
+            await e.send_command(b"a")
+        self.assertEqual(e.t.commands, [])
+
+    async def test_throttle_exempts_get_response_trigger(self):
+        e = euicc(["9000", "9000", "9000"])
+        e.delay_over_counter = 1
+        with patch("beesim.asyncio.sleep", new=AsyncMock()) as sleep:
+            await e.send_command(bytes.fromhex("81E2910000"))
+            await e.send_command(bytes.fromhex("81C0000000"))
+            await e.send_command(bytes.fromhex("81E2910000"))
+            # ScriptedTransport also yields via sleep(0); only count 1.2s waits.
+            self.assertEqual(sum(call.args == (1.2,) for call in sleep.call_args_list), 1)
+
+
+class APITests(unittest.IsolatedAsyncioTestCase):
+    async def test_enable_already_enabled_is_success(self):
+        raw = bytes.fromhex("BF3103800102")
+        sim = b.BeeSim(euicc(response_sequence(raw)))
+        self.assertTrue(await sim.enable_profile("8901"))
+
+    async def test_filtered_profiles_and_extended_fields(self):
+        profile = b.tlv(0xE3, b.tlv(0x5A, bytes.fromhex("9810")), b.tlv([0x9F, 0x70], b"\x01"),
+                        b.tlv(0x93, b"\x02"), b.tlv(0x94, b"icon"), b.tlv(0x99, b"\x01"))
+        raw = b.tlv([0xBF, 0x2D], b.tlv(0xA0, profile))
+        sim = b.BeeSim(euicc(response_sequence(raw)))
+        profiles = await sim.get_profiles("5C075A9F7090919295")
+        self.assertEqual(profiles[0]["iccid"], "8901")
+        self.assertEqual(profiles[0]["iconType"], "png")
+        self.assertEqual(profiles[0]["profilePolicyRules"], "01")
+        self.assertEqual(sim.e.t.commands[4][5:], bytes.fromhex("BF2D095C075A9F7090919295"))
+
+    async def test_info_negotiates_protocol(self):
+        raw = bytes.fromhex("BF20058203020300")
+        sim = b.BeeSim(euicc(response_sequence(raw)))
+        self.assertEqual((await sim.get_euicc_info1())["svn"], "2.3.0")
+        self.assertEqual(sim.protocol, "gsma/rsp/v2.3.0")
+
+    async def test_confirmation_hash_uses_signed_transaction(self):
+        signed = b.tlv(0x30, b.tlv(0x80, b"\x01\x02"), b.tlv(1, b"\xff"))
+        sim = b.BeeSim(euicc([]))
+        with self.assertRaisesRegex(ValueError, "Confirmation"):
+            await sim.prepare_download(signed, b"", b"")
+        sim._read = AsyncMock(return_value=bytes.fromhex("BF2102A000"))
+        await sim.prepare_download(signed, b"", b"", "1234")
+        import hashlib
+        expected = hashlib.sha256(hashlib.sha256(b"1234").digest() + b"\x01\x02").digest()
+        self.assertIn(b.tlv(4, expected), sim._read.call_args.args[0])
+
+    async def test_notification_delivery_failure_does_not_delete(self):
+        metadata = b.tlv([0xBF, 0x2F], b.tlv(0x80, b"\x01"), b.tlv(0x0C, b"rsp.example.com"))
+        item = b.tlv(0x30, metadata)
+        raw = b.tlv([0xBF, 0x2B], b.tlv(0xA0, item))
+        sim = b.BeeSim(euicc([]))
+        sim.retrieve_notification = AsyncMock(return_value=raw)
+        sim.remove_notification = AsyncMock()
+        gateway = SimpleNamespace(execute=AsyncMock(side_effect=RuntimeError("offline")))
+        with self.assertRaisesRegex(RuntimeError, "offline"):
+            await sim.send_notification("01", gateway)
+        sim.remove_notification.assert_not_awaited()
+        gateway.execute.side_effect = None
+        await sim.send_notification("01", gateway)
+        sim.remove_notification.assert_awaited_once_with("01")
+        import base64
+        self.assertEqual(gateway.execute.call_args.args[3]["pendingNotification"], base64.b64encode(item).decode())
+
+    async def test_firmware_headers_and_failure_stop(self):
+        e = euicc(["10000001", "10000001", "9000"])
+        await b.BeeSim(e).download_firmware(["F001", "F200"], log=lambda _: None)
+        self.assertEqual(e.t.commands[:2], [bytes.fromhex("00020001F001"), bytes.fromhex("00020002F200")])
+        self.assertEqual(e.t.commands[-1], bytes.fromhex("A03F000000"))
+        e = euicc(["00000000"])
+        with self.assertRaises(RuntimeError):
+            await b.BeeSim(e).download_firmware(["F001"], log=lambda _: None)
+        self.assertEqual(len(e.t.commands), 1)
+        self.assertEqual(e.delay_over_counter, 0)
+
+
+class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_immediate_notification_and_response_write_mode(self):
+        class Client:
+            async def write_gatt_char(client, uuid, packet, response):
+                self.assertTrue(response)
+                self.assertEqual(packet, bytes.fromhex("01010070000100"))
+                transport._on_notify(None, bytearray.fromhex("01019000"))
+        transport = b.BeeSimTransport(Client(), "w", "n", write_with_response=True)
+        self.assertEqual(await transport.send(bytes.fromhex("0070000100")), bytes.fromhex("9000"))
+
+    async def test_fragment_reassembly_and_serialization(self):
+        class Client:
+            async def write_gatt_char(client, uuid, packet, response):
+                await asyncio.sleep(0)
+                if packet[0] == packet[1]:
+                    transport._on_notify(None, bytearray.fromhex("0201AABB"))
+                    transport._on_notify(None, bytearray.fromhex("0202CC9000"))
+        transport = b.BeeSimTransport(Client(), "w", "n")
+        self.assertEqual(await transport.send(b"a" * 20), bytes.fromhex("AABBCC9000"))
+        results = await asyncio.gather(transport.send(b"a"), transport.send(b"b"))
+        self.assertEqual(results, [bytes.fromhex("AABBCC9000")] * 2)
+
+    async def test_timeout_requires_fresh_session(self):
+        transport = b.BeeSimTransport(SimpleNamespace(write_gatt_char=AsyncMock()), "w", "n", timeout=0.01)
+        with self.assertRaises(TimeoutError):
+            await transport.send(b"a")
+        with self.assertRaises(ConnectionError):
+            await transport.send(b"b")
+
+    async def test_out_of_order_frame_rejected(self):
+        class Client:
+            async def write_gatt_char(client, *args, **kwargs):
+                transport._on_notify(None, bytearray.fromhex("02029000"))
+        transport = b.BeeSimTransport(Client(), "w", "n")
+        with self.assertRaisesRegex(RuntimeError, "Out-of-order"):
+            await transport.send(b"a")
+
+    async def test_disconnect_interrupts_pending_response(self):
+        class Client:
+            async def write_gatt_char(client, *args, **kwargs):
+                transport.disconnected(client)
+        transport = b.BeeSimTransport(Client(), "w", "n")
+        with self.assertRaises(ConnectionError):
+            await transport.send(b"a")
+
+    async def test_connect_prefers_no_response_and_cleans_failure(self):
+        chars = [SimpleNamespace(uuid="write", properties=["write"]),
+                 SimpleNamespace(uuid="write-nr", properties=["write-without-response"]),
+                 SimpleNamespace(uuid="notify", properties=["notify"])]
+        client = SimpleNamespace(connect=AsyncMock(), disconnect=AsyncMock(), start_notify=AsyncMock(),
+                                 services=[SimpleNamespace(uuid=b.SERVICE_UUID, characteristics=chars)])
+        with patch.object(b, "BleakClient", return_value=client):
+            _, _, e = await b.connect("test")
+        self.assertEqual(e.t.write_uuid, "write-nr")
+        self.assertFalse(e.t.write_with_response)
+        client.services = []
+        with patch.object(b, "BleakClient", return_value=client), self.assertRaises(RuntimeError):
+            await b.connect("test")
+        client.disconnect.assert_awaited_once()

@@ -1,25 +1,46 @@
-# BeeSIM BLE controller
+# beeesim-t
+
+本项目基于 [cyyself/beeesim-api](https://github.com/cyyself/beeesim-api)
+二次开发，保留原作者的 Git 历史、BLE 协议逆向分析及 CLI/TUI 基础实现。
+在此基础上，API 逻辑已更新至官方 **BeeSIM Web 2.3.6**，适配目标为官方
+**1.3.6 固件**，并增加启动时选择中文或 English 的双语 TUI。
+
+This project is based on [cyyself/beeesim-api](https://github.com/cyyself/beeesim-api).
+Credit for the original controller and reverse-engineered BLE/eUICC protocol
+goes to **cyyself**. This version updates the API implementation to official
+**BeeSIM Web 2.3.6**, targets **firmware 1.3.6**, and adds a Chinese/English TUI
+with language selection at startup.
+
+兼容性验证：46 项模拟协议、HTTP 合约和 TUI 自动化测试已在 Docker 中通过；
+真实 1.3.6 固件芯片上的连接、下载和刷写仍需人工实测。下文沿用的硬件观察、
+厂商披露及第一人称试验描述来自原作者记录，不代表本项目已重新完成这些试验。
+
+## BeeSIM BLE controller
 
 Pure-Bluetooth control for **BeeSIM eUICC cards**, reverse-engineered from the
-official web LPA at `https://beeesim.com/ble/` (build *"BeeSIM Web v2.1.4"*).
+official web LPA at `https://beeesim.com/ble/` (build *"BeeSIM Web v2.3.6"*).
 Download, enable, disable, delete and rename eSIM profiles, read the EID & card
 info, manage notifications, and set the card's BLE TX power. Profile management
 is all over BLE; downloading a new profile additionally talks to the operator's
 SM-DP+ (unavoidable in GSMA RSP). Ships with a CLI and a Textual terminal UI
-(with a live signal-strength readout) in a single file.
+(with a live signal-strength readout), a Chinese/English TUI, and the official
+Web HTTP API adapter. Downloads use the official HTTPS proxy by default;
+direct SM-DP+ access remains available with `--rsp-transport direct`.
 
 ## Install
 
 ```bash
-pip install bleak          # required (BLE)
-pip install textual        # optional — only for the terminal UI
-# or: pip install -r requirements.txt
+python3 -m venv .venv      # Python 3.11 or newer
+source .venv/bin/activate
+pip install --only-binary=:all: -r requirements.txt
 ```
 
 ## Quick start
 
 ```bash
 python beesim.py                       # launch the terminal UI (default)
+python beesim.py --lang zh             # 中文界面
+python beesim.py --lang en             # English interface
 python beesim.py list                  # CLI: list profiles as JSON
 python beesim.py enable  <iccid>       # enable a profile (then `reset`)
 python beesim.py disable <iccid>
@@ -34,6 +55,15 @@ python beesim.py --help                # full command list
 
 `python beesim.py` (or `python beesim.py tui`) opens the TUI:
 
+启动时先选择「中文」或「English」。按钮、快捷键说明、弹窗、操作提示和状态均随
+语言切换；ICCID、EID、APDU、协议字段和用户设置的配置名称保持原样。运行中按
+`l` 可切换语言；`--lang zh` 或 `--lang en` 可跳过启动选择。
+
+Choose Chinese or English at startup, or use `--lang zh` / `--lang en`.
+Press `l` to change language while running. No BLE operation starts before
+language selection. The UI includes communication settings, confirmation-code
+entry, notification delivery, and confirmed local firmware upgrades.
+
 - **sidebar** — connection status, **live RSSI** (BLE signal strength), EID,
   Scan/Connect, Refresh, **Download eSIM**, Enable/Disable/Delete/Rename,
   **TX Power**, Reset card
@@ -42,6 +72,66 @@ python beesim.py --help                # full command list
 - **keys** — `s` scan · `r` refresh · `o` download · `e`/`d` enable/disable ·
   `x` delete · `n` rename · `i` info · `N` notifications · `t` TX power ·
   `a` raw APDU · `c` disconnect · `q` quit
+
+### Web 2.3.6 compatibility
+
+The default STORE DATA block size is 120 bytes, BLE payload groups are still
+18 bytes, and APDU timeout is 30 seconds. The transport serializes requests,
+interrupts pending waits on disconnect, and supports the Web firmware's FE
+response handling. APDU operations throttle after the Web threshold of 6;
+BPP and firmware writes use 20, with 1.2-second pauses when triggered.
+
+Initialization sends CLOSE, device features, OPEN and SELECT in Web order.
+Unlike the old Python version, an OPEN response such as `6A86` does not
+immediately abort: SELECT determines whether the ISD-R is usable. Unlike the
+Web's unchecked initialization, failed SELECT is reported and never marks the
+session initialized. This compatibility change does **not** prove that every
+hardware `6A86` has been resolved. After a transport timeout, reconnect before
+sending more commands so a late reply cannot be mistaken for a new response.
+
+```bash
+python beesim.py --timeout 30 --store-max-lc 120 --channel 1 eid
+python beesim.py list --selector 5C075A9F7090919295
+python beesim.py notifications --operation INSTALL
+python beesim.py notification-get       # retrieve all, as raw TLV
+python beesim.py notification-send 01    # hexadecimal index; sends before deletion
+python beesim.py notification-remove 01  # explicitly discard one notification
+python beesim.py firmware-status
+python beesim.py firmware-versions
+python beesim.py firmware-write vendor-firmware.txt --yes
+python beesim.py firmware-write vendor-firmware.txt --resume --yes
+```
+
+The firmware text parser accepts vendor F0 rows and a final F2 row, extracts
+the embedded CRC, and checks progress before resuming. A write failure stops
+the sequence. Actual firmware flashing and BLE hardware still require manual
+device validation; automated tests use simulated cards.
+
+`beesim_web.WebAPI` exposes all seven HTTP endpoint families found in the
+public Web bundle: RSP, firmware, login, account device management, email
+verification, user profile, and logging. Public client signing constants are
+decoded with `cryptography`; user tokens remain in memory. The low-level CLI
+uses `python beesim.py web <family> <action> --data-file payload.json` and reads
+an account token from `BEESIM_TOKEN` when required. For example, read firmware
+versions with `python beesim.py web firmware get_versions --data-file payload.json`,
+where the JSON is `{"key":"BEESIM_FW_UPGRADE_NONE"}`. Do not put account or
+activation payload files in Git. Account login helpers are also available via
+`WebAPI.login(account, password=...)` or `vercode=...`.
+
+All official requests use `https://beeesim.com/fetch/...`; `action` is a query
+parameter and the body is JSON. Account-side `reset_pin` is an HTTP operation,
+not a new BLE PIN verification command. Debug logs are **not uploaded
+automatically**; `WebAPI.upload_logs` is an explicit operation.
+
+The source URLs, hashes, defaults, HTTP contracts, and intentional safety
+differences are recorded in `web-api-reference.json`. The existing `src/` and
+`assets/` folders remain historical Web captures; they are not runtime inputs.
+
+### Automated checks
+
+`Dockerfile.test` runs the simulated protocol, HTTP contract and Textual headless
+UI tests with `python -m unittest discover -s tests -v`. The tests do not need
+a BLE adapter, browser, account credentials, real eSIM profile or network API.
 
 The RSSI readout polls the **connected link** every ~2 s (via the platform
 backend — CoreBluetooth on macOS, BlueZ on Linux). BeeSIM cards stop advertising
@@ -170,7 +260,7 @@ For existing users, I recommend **lowering the BLE TX power to 0** (see above).
 ## Protocol reference (reverse-engineered)
 
 Source: the official web LPA at `https://beeesim.com/ble/` — a Vue 3 SPA,
-build string **"BeeSIM Web v2.1.4"**. All of the below was recovered by
+build string **"BeeSIM Web v2.3.6"**. The protocol was recovered by
 downloading and de-minifying the JS chunks (`index`, `i18n` (contains the BLE
 core), `utils`, `pages`). The card is a **GSMA SGP.22 eUICC** (Remote SIM
 Provisioning) reachable over Bluetooth Low Energy.
@@ -240,7 +330,7 @@ pulled with **GET RESPONSE**:
 
 ```
 STORE DATA :  81 E2 <P1> <blk> <Lc> <data>   P1 = 0x11 (more) / 0x91 (last), blk from 0
-              max 239 data bytes per block; last block replies 61 <len>
+              default 120 data bytes per block (configurable); last block replies 61 <len>
 GET RESPONSE: 81 C0 00 00 <len>              loop while SW=61 xx; done on 90 00
 ```
 
@@ -300,7 +390,7 @@ e.g. `89014103...` is stored/sent as `98104130...`.
 
 `download_profile()` (CLI `download`, TUI *Download eSIM* / `o`) does a full GSMA
 SGP.22 download: **ES10b card commands over BLE** interleaved with **ES9+ server
-commands sent straight to the operator's SM-DP+** (no proxy). Downloading a new
+commands sent through the official Web proxy by default**. Downloading a new
 profile inherently needs that SM-DP+ dialogue — the profile lives on the server;
 the card supplies the crypto.
 
@@ -312,21 +402,29 @@ the card supplies the crypto.
 [5] ES10b PrepareDownload     (BF21, +hashCc if a confirmation code)   (BLE)
 [6] ES9+  getBoundProfilePackage                   → SM-DP+
 [7] ES10b LoadBoundProfilePackage: BPP split into ES8+ STORE DATA blocks (BLE)
+[8] ES9+ handleNotification, then remove the acknowledged card notification
 ```
 
-ES9+ endpoints are `POST https://<smdp>/gsma/rsp2/es9plus/<function>` with headers
-`X-Admin-Protocol: gsma/rsp/v2.2.0`, `User-Agent: gsma-rsp-lpad`. The profile
+Direct-mode ES9+ endpoints are `POST https://<smdp>/gsma/rsp2/es9plus/<function>` with headers
+`X-Admin-Protocol` negotiated from the card SVN and `User-Agent: gsma-rsp-lpad`. The profile
 installs **disabled**; enable it with `enable <iccid>`. Confirmation-code profiles:
 pass `--confirm-code`. Activation codes are `LPA:1$<smdp>$<matchingId>[$<oid>][$<ccRequired>]`.
 
-**TLS to the SM-DP+ is intentionally not web-PKI-verified.** GSMA RSP has its own
+**In optional direct mode, TLS to the SM-DP+ is not web-PKI-verified.** The
+default official proxy uses normal verified HTTPS to BeeSIM. GSMA RSP has its own
 end-to-end mutual authentication in the *payload*: the eUICC checks the SM-DP+
 certificate chain up to the GSMA CI and every signature (a forged server fails
 step 3, AuthenticateServer), and the SM-DP+ verifies the eUICC. TLS is only
 transport confidentiality here, and SM-DP+ certs are signed by the **GSMA RSP2
 Root CI1** (the eSIM PKI root, key id `81370F…` — the same CI your card trusts),
 not a public web CA. So `beesim.py` skips the web-PKI check rather than shipping
-or downloading a CA bundle; forging a profile over a TLS MITM is still impossible.
+or downloading a CA bundle. The card is responsible for RSP payload authentication.
+
+The proxy receives the matching ID and RSP protocol data. The TUI confirms the
+selected route before installation. Failed notification delivery leaves the
+notification on the card: refresh profiles and retry `notification-send`, rather
+than repeating the profile download. TX power is raised to 4 for installation
+and restoration to 1 is attempted on both success and failure.
 
 > Verified end-to-end on real hardware: a **BetterRoaming** GSMA-test profile
 > (`LPA:1$rsp.truphone.com$QRF-BETTERROAMING-…`) downloaded and installed over BLE.
@@ -389,7 +487,11 @@ APDUs — it could not be exercised, and nothing is wired in.
 
 | File | What |
 |------|------|
-| `beesim.py` | single-file controller: BLE transport + eUICC + ES10 + eSIM download + CLI + Textual TUI |
+| `beesim.py` | BLE transport, eUICC/ES10, eSIM download, firmware writes and CLI |
+| `beesim_web.py` | Web 2.3.6 HTTP API, signing and optional direct RSP |
+| `beesim_tui.py`, `beesim_i18n.py` | language selection, Chinese/English Textual UI and strings |
+| `tests/`, `Dockerfile.test` | simulated protocol, HTTP contract and headless TUI tests |
+| `web-api-reference.json` | Web 2.3.6 source hashes, endpoint contracts and compatibility notes |
 | `README.md` | this document |
-| `requirements.txt` | `bleak` (+ `textual` for the TUI) |
+| `requirements.txt` | `bleak`, `textual`, `cryptography` |
 | `assets/`, `src/` | the downloaded web-app sources (raw JS chunks) |

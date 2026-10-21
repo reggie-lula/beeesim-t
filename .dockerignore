@@ -1,0 +1,6 @@
+*
+!requirements.txt
+!Dockerfile.test
+!beesim*.py
+!tests/
+!tests/**

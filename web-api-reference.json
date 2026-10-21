@@ -1,0 +1,147 @@
+{
+  "version": "BeeSIM Web v2.3.6",
+  "source": "https://beeesim.com/ble/",
+  "fetched_at_utc": "2026-10-21T02:53:38.756743+00:00",
+  "sources": {
+    "assets/index-DrmplIO0.js": {
+      "bytes": 5845,
+      "sha256": "f4c8d07581d542c9fd6b79d6df4bfe8765e694dd20ee1661a0d5f0d5e2be9f2b"
+    },
+    "assets/pages-BKD8U7NR.js": {
+      "bytes": 44775,
+      "sha256": "a9dd0f219471967bb605dedcbd2bde947433b96f418a819b91029709a03ea56e"
+    },
+    "assets/utils-v_n99D2T.js": {
+      "bytes": 64969,
+      "sha256": "b95a4aeb4169f146933bac706b071d26921788e9e2f57b8152793d9a0a6fccbb"
+    },
+    "index.html": {
+      "bytes": 681,
+      "sha256": "09e43a9a622500855216c97bdb3d6fadb07c5372a5fe3e589d0fffb564aa67ab"
+    }
+  },
+  "defaults": {
+    "channel": 1,
+    "store_max_lc": 120,
+    "reply_timeout_ms": 30000,
+    "delay_over_counter_app": 6,
+    "delay_ms": 1200,
+    "delay_over_counter_bpp_or_firmware": 20,
+    "enable_pin": false
+  },
+  "http": {
+    "base_url": "https://beeesim.com",
+    "transport_prefix": "/fetch",
+    "method": "POST",
+    "query_key": "action",
+    "body": "JSON",
+    "response_envelope": "status,msg,data (endpoint dependent)",
+    "endpoints": [
+      {
+        "path": "/v2/plugin/esim/rsp/es9plus/execute.do",
+        "actual_path": "/fetch/v2/plugin/esim/rsp/es9plus/execute.do",
+        "actions": [
+          "initiateAuthentication",
+          "authenticateClient",
+          "getBoundProfilePackage",
+          "handleNotification"
+        ],
+        "body_fields": "smdpAddress, protocol, plus per-action request fields",
+        "explicit_headers": "No explicit B/X signing headers in wrapper"
+      },
+      {
+        "path": "/v2/plugin/mall/firmware.do",
+        "actual_path": "/fetch/v2/plugin/mall/firmware.do",
+        "actions": [
+          "get_versions",
+          "get_firmware"
+        ],
+        "body_fields": "key; name for get_firmware",
+        "explicit_headers": "X-Timestamp, X-Sign"
+      },
+      {
+        "path": "/v1/main/user/mall/login.do",
+        "actual_path": "/fetch/v1/main/user/mall/login.do",
+        "actions": [
+          "login",
+          "modify_pwd"
+        ],
+        "body_fields": "login: by, account, password or vercode; modify_pwd: account, vercode, password",
+        "explicit_headers": "B-Timestamp, B-Sign"
+      },
+      {
+        "path": "/v1/main/user/mall/jwt/bluetooth.do",
+        "actual_path": "/fetch/v1/main/user/mall/jwt/bluetooth.do",
+        "actions": [
+          "list",
+          "bind",
+          "unbind",
+          "reset_pin"
+        ],
+        "body_fields": "list: {}; others: eid",
+        "explicit_headers": "B-Timestamp, B-Sign, B-Token"
+      },
+      {
+        "path": "/v1/main/common/mall/vercode.do",
+        "actual_path": "/fetch/v1/main/common/mall/vercode.do",
+        "actions": [
+          "email"
+        ],
+        "body_fields": "to",
+        "explicit_headers": "B-Timestamp, B-Sign"
+      },
+      {
+        "path": "/v1/main/user/mall.do",
+        "actual_path": "/fetch/v1/main/user/mall.do",
+        "actions": [
+          "save"
+        ],
+        "body_fields": "nickname",
+        "explicit_headers": "B-Timestamp, B-Sign"
+      },
+      {
+        "path": "/v1/main/common/logger.do",
+        "actual_path": "/fetch/v1/main/common/logger.do",
+        "actions": [
+          "save",
+          "is_exclude_pe"
+        ],
+        "body_fields": "save: message,eid,smdpAddress,matchingId,content; is_exclude_pe: smdpAddress",
+        "explicit_headers": "No explicit B/X signing headers in wrapper"
+      }
+    ]
+  },
+  "rsp_action_fields": {
+    "initiateAuthentication": [
+      "euiccChallenge",
+      "euiccInfo1",
+      "smdpAddress",
+      "protocol"
+    ],
+    "authenticateClient": [
+      "transactionId",
+      "authenticateServerResponse",
+      "smdpAddress",
+      "protocol"
+    ],
+    "getBoundProfilePackage": [
+      "transactionId",
+      "prepareDownloadResponse",
+      "smdpAddress",
+      "protocol"
+    ],
+    "handleNotification": [
+      "pendingNotification",
+      "smdpAddress",
+      "protocol"
+    ]
+  },
+  "intentional_differences": [
+    "SELECT is validated before initialization is marked complete.",
+    "BLE/APDU operations are serialized and a timed-out transport requires reconnection.",
+    "TX power restoration is attempted on failure as well as success.",
+    "No automatic upload of diagnostic logs.",
+    "Direct RSP mode remains optional; default is the official Web proxy.",
+    "BLE channel encoding is limited to channels 1..3."
+  ]
+}
